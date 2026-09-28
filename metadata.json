@@ -1,0 +1,8 @@
+{
+  "name": "GR AI",
+  "description": "GR AI - Private developer & cybersecurity workbench. Developed and Idea by GM Ripon. 100% On-Device & Cloud AI, custom team rules, and 1.5GB model streaming.",
+  "requestFramePermissions": [],
+  "majorCapabilities": [
+    "MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"
+  ]
+}

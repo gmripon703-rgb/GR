@@ -1,0 +1,10 @@
+<resources>
+    <string name="app_name">GR AI</string>
+    <string name="tagline">GR AI - Developer &amp; Cybersecurity Workbench</string>
+    <string name="nav_assistant">AI Copilot</string>
+    <string name="nav_scanner">Code Audit</string>
+    <string name="nav_owasp">OWASP Audit</string>
+    <string name="nav_tools">Cyber Toolkit</string>
+    <string name="nav_playbooks">Playbooks</string>
+    <string name="status_ready">Standby (100% On-Device &amp; Private)</string>
+</resources>
