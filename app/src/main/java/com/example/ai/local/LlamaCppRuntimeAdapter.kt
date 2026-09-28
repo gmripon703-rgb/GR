@@ -5,29 +5,53 @@ import com.example.ai.AIRequest
 import com.example.ai.AIResponse
 import com.example.ai.ProviderType
 import kotlinx.coroutines.Dispatchers
-import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.flow
 import kotlinx.coroutines.withContext
 import java.io.File
 
+/**
+ * Adapter for GGUF model loading and native llama.cpp execution.
+ *
+ * When native JNI libraries (libllama.so) are not bundled in the build, this adapter
+ * validates GGUF binary format and header integrity, but transparently reports that
+ * native neural inference is pending JNI library linkage. It does NOT fabricate fake
+ * neural outputs or pretend to run neural weights.
+ */
 class LlamaCppRuntimeAdapter : LocalModelRuntime {
 
-    override val runtimeName: String = "llama.cpp / GGUF Runtime"
+    override val runtimeName: String = "GGUF Runtime (llama.cpp JNI placeholder)"
     override var isModelLoaded: Boolean = false
         private set
     override var currentModelPath: String? = null
         private set
 
+    var headerInfo: GgufHeaderInfo? = null
+        private set
+
+    val isNativeInferenceAvailable: Boolean by lazy {
+        try {
+            System.loadLibrary("llama")
+            true
+        } catch (_: UnsatisfiedLinkError) {
+            false
+        } catch (_: Exception) {
+            false
+        }
+    }
+
     private var activeThreadCount: Int = 4
     private var loadedModelName: String = "none"
 
     override suspend fun loadModel(modelFile: File, threadCount: Int): Result<Unit> = withContext(Dispatchers.IO) {
-        if (!modelFile.exists() || modelFile.length() == 0L) {
-            return@withContext Result.failure(IllegalArgumentException("Model file does not exist or is empty"))
+        val validation = GgufFileValidator.validate(modelFile)
+        if (validation.isFailure) {
+            return@withContext Result.failure(
+                validation.exceptionOrNull() ?: IllegalArgumentException("Failed to validate GGUF file")
+            )
         }
 
-        // Memory & validation check
+        headerInfo = validation.getOrNull()
         currentModelPath = modelFile.absolutePath
         activeThreadCount = threadCount.coerceIn(1, 8)
         loadedModelName = modelFile.nameWithoutExtension
@@ -40,6 +64,7 @@ class LlamaCppRuntimeAdapter : LocalModelRuntime {
         isModelLoaded = false
         currentModelPath = null
         loadedModelName = "none"
+        headerInfo = null
     }
 
     override suspend fun generate(request: AIRequest): Result<AIResponse> = withContext(Dispatchers.Default) {
@@ -47,20 +72,18 @@ class LlamaCppRuntimeAdapter : LocalModelRuntime {
             return@withContext Result.failure(IllegalStateException("No model loaded in GGUF runtime"))
         }
 
-        val start = System.currentTimeMillis()
-        val text = buildLocalInferenceAnswer(request)
-        val latency = System.currentTimeMillis() - start
-
-        Result.success(
-            AIResponse(
-                text = text,
-                modelName = loadedModelName,
-                providerType = ProviderType.LOCAL,
-                promptTokens = request.prompt.length / 4,
-                completionTokens = text.length / 4,
-                latencyMs = latency
+        if (!isNativeInferenceAvailable) {
+            return@withContext Result.failure(
+                UnsupportedOperationException(
+                    "Native llama.cpp JNI library (libllama.so) is not bundled in this APK build. " +
+                    "GGUF binary format is validated, but neural weights execution requires compiling libllama.so for device ABI. " +
+                    "Please use the on-device Developer Rule Engine or Cloud AI."
+                )
             )
-        )
+        }
+
+        // Native JNI inference call would occur here when libllama.so is linked
+        Result.failure(UnsupportedOperationException("Native inference not implemented without libllama.so"))
     }
 
     override fun stream(request: AIRequest): Flow<AIChunk> = flow {
@@ -75,40 +98,24 @@ class LlamaCppRuntimeAdapter : LocalModelRuntime {
             return@flow
         }
 
-        val text = buildLocalInferenceAnswer(request)
-        val words = text.split(" ")
-        val acc = StringBuilder()
-
-        for ((idx, word) in words.withIndex()) {
-            delay(20) // Streaming token generation
-            val chunk = if (idx == 0) word else " $word"
-            acc.append(chunk)
+        if (!isNativeInferenceAvailable) {
+            val notice = "⚠️ GGUF model format validated, but native llama.cpp library (libllama.so) is not bundled in this APK build. Switching to on-device Rule Engine."
             emit(
                 AIChunk(
-                    deltaText = chunk,
-                    isFinal = idx == words.size - 1,
-                    fullTextAccumulated = acc.toString(),
-                    finishReason = if (idx == words.size - 1) "stop" else null
+                    deltaText = notice,
+                    isFinal = true,
+                    fullTextAccumulated = notice
                 )
             )
+            return@flow
         }
-    }
 
-    private fun buildLocalInferenceAnswer(request: AIRequest): String {
-        val p = request.prompt.trim()
-        return buildString {
-            appendLine("🤖 **Local Neural Model [$loadedModelName] (Offline)**")
-            appendLine("Processed on $activeThreadCount CPU cores using on-device GGUF quantization.")
-            appendLine()
-            appendLine("```kotlin")
-            appendLine("// Code solution generated locally:")
-            appendLine("fun handleRequest(input: String): String {")
-            appendLine("    // Validated on-device without internet transmission")
-            appendLine("    return \"Clean Result: \${input.trim()}\"")
-            appendLine("}")
-            appendLine("```")
-            appendLine()
-            appendLine("Summary: Execution completed entirely in device RAM ($loadedModelName).")
-        }
+        emit(
+            AIChunk(
+                deltaText = "Native runtime not available.",
+                isFinal = true,
+                fullTextAccumulated = "Native runtime not available."
+            )
+        )
     }
 }

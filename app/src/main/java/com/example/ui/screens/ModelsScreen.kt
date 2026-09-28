@@ -1105,7 +1105,7 @@ fun GoogleDriveCloudModelsView(
     val preferCloudStorage by viewModel.preferCloudStorage.collectAsState()
 
     var driveUrlInput by remember { mutableStateOf("") }
-    var emailInput by remember { mutableStateOf(accountEmail.ifBlank { "gmripon703@gmail.com" }) }
+    var oauthTokenInput by remember { mutableStateOf(viewModel.secureStorage.googleDriveAccessToken) }
     var statusMessage by remember { mutableStateOf<String?>(null) }
 
     LazyColumn(
@@ -1217,26 +1217,50 @@ fun GoogleDriveCloudModelsView(
                             )
                         }
                     } else {
+                        Text(
+                            text = "OAuth Access Token Required:",
+                            fontSize = 12.sp,
+                            fontWeight = FontWeight.SemiBold,
+                            color = CyberCyan
+                        )
+                        Text(
+                            text = "Requires an active OAuth access token with scope https://www.googleapis.com/auth/drive.file (Project directed-strata-503219-e4).",
+                            fontSize = 10.sp,
+                            color = MaterialTheme.colorScheme.onSurfaceVariant
+                        )
+
                         OutlinedTextField(
-                            value = emailInput,
-                            onValueChange = { emailInput = it },
-                            label = { Text("Google Account Email:") },
-                            placeholder = { Text("gmripon703@gmail.com") },
+                            value = oauthTokenInput,
+                            onValueChange = { oauthTokenInput = it },
+                            label = { Text("Google OAuth Access Token (Bearer):") },
+                            placeholder = { Text("ya29.a0...") },
                             modifier = Modifier.fillMaxWidth(),
                             shape = RoundedCornerShape(8.dp),
                             singleLine = true
                         )
 
                         Button(
-                            onClick = { viewModel.connectGoogleAccount(emailInput, "GM Ripon") },
+                            onClick = {
+                                viewModel.authenticateGoogleDrive(oauthTokenInput) { success, msg ->
+                                    statusMessage = msg
+                                }
+                            },
+                            enabled = oauthTokenInput.isNotBlank() && !isSyncing,
                             colors = ButtonDefaults.buttonColors(containerColor = CyberGreen, contentColor = Color(0xFF00381B)),
                             shape = RoundedCornerShape(8.dp),
                             modifier = Modifier.fillMaxWidth()
                         ) {
                             Icon(imageVector = Icons.Default.CloudSync, contentDescription = null, modifier = Modifier.size(16.dp))
                             Spacer(modifier = Modifier.width(6.dp))
-                            Text("Connect Google Account for Google Drive", fontWeight = FontWeight.Bold)
+                            Text("Authenticate & Verify Google Drive", fontWeight = FontWeight.Bold)
                         }
+
+                        Text(
+                            text = "Client ID: 489759037793-k53vkat7e5ujld1a9cjj3uj4iljruvlp.apps.googleusercontent.com",
+                            fontSize = 9.sp,
+                            fontFamily = FontFamily.Monospace,
+                            color = MaterialTheme.colorScheme.onSurfaceVariant
+                        )
                     }
                 }
             }

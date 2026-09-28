@@ -42,10 +42,11 @@ class AIProviderRouter(
                 }
             }
             else -> { // "AUTO"
-                if (isOnline && allowCloud) {
+                val hasCloudCredentials = secureStorage.getEffectiveApiKey().isNotBlank() || secureStorage.customBaseUrl.isNotBlank()
+                if (isOnline && allowCloud && hasCloudCredentials) {
                     cloudAIProvider to "Auto: Cloud Available"
                 } else {
-                    localAIProvider to "Auto: Offline Mode (Local Compute)"
+                    localAIProvider to "Auto: On-Device Engine (Offline)"
                 }
             }
         }

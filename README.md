@@ -1,5 +1,6 @@
 # GR AI — Developer & Defensive Cybersecurity Mobile Suite
 
+**Repository:** [https://github.com/gmripon703-rgb/GR](https://github.com/gmripon703-rgb/GR)  
 **Developed and Idea by:** GM Ripon  
 **WhatsApp:** [+8801911527072](https://wa.me/8801911527072) (Tap in-app for direct WhatsApp chat or phone call)
 
@@ -29,14 +30,14 @@
 
 ### 1. Clone from GitHub
 ```bash
-git clone https://github.com/<YOUR_GITHUB_USERNAME>/GR_AI.git
-cd GR_AI
+git clone https://github.com/gmripon703-rgb/GR.git
+cd GR
 ```
 
 ### 2. Open in Android Studio
 1. Open **Android Studio** (Koala, Ladybug, Meerkat, or newer).
 2. Click **File > Open...** and select the root directory of the cloned project.
-3. Android Studio will automatically recognize the Gradle build files and sync the dependencies.
+3. Android Studio will automatically recognize the Gradle build files and sync dependencies.
 
 ### 3. Direct APK Export (Debug or Release)
 - **Direct Debug APK:**
@@ -48,7 +49,8 @@ cd GR_AI
   - Press the green **Run (Play)** button in Android Studio.
 - **Direct Command-Line Build:**
   ```bash
-  gradle assembleDebug
+  ./gradlew assembleDebug
+  ./gradlew testDebugUnitTest
   ```
 
 ---

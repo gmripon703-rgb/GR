@@ -34,14 +34,15 @@ class LocalAIProvider(
     }
 
     override suspend fun generate(request: AIRequest): Result<AIResponse> {
-        return if (runtime.isModelLoaded) {
+        val llamaAdapter = runtime as? LlamaCppRuntimeAdapter
+        return if (runtime.isModelLoaded && llamaAdapter?.isNativeInferenceAvailable == true) {
             runtime.generate(request)
         } else {
             val answer = LocalRuleEngineFallback.generateOfflineResponse(request)
             Result.success(
                 AIResponse(
                     text = answer,
-                    modelName = "on-device-rule-engine",
+                    modelName = "On-Device Rule Engine (Offline)",
                     providerType = ProviderType.LOCAL
                 )
             )
@@ -49,7 +50,8 @@ class LocalAIProvider(
     }
 
     override fun stream(request: AIRequest): Flow<AIChunk> {
-        return if (runtime.isModelLoaded) {
+        val llamaAdapter = runtime as? LlamaCppRuntimeAdapter
+        return if (runtime.isModelLoaded && llamaAdapter?.isNativeInferenceAvailable == true) {
             runtime.stream(request)
         } else {
             LocalRuleEngineFallback.streamOfflineResponse(request)

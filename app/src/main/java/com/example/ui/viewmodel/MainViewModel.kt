@@ -430,8 +430,16 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
         }
     }
 
-    fun connectGoogleAccount(email: String, name: String = "GM Ripon", token: String = "") {
-        googleDriveManager.connectGoogleAccount(email, name, token)
+    fun authenticateGoogleDrive(token: String, onComplete: (Boolean, String) -> Unit) {
+        viewModelScope.launch {
+            val result = googleDriveManager.authenticateWithToken(token)
+            if (result.isSuccess) {
+                val quota = result.getOrNull()
+                onComplete(true, "Successfully authenticated with Google Drive for ${quota?.userEmail ?: "user"}")
+            } else {
+                onComplete(false, result.exceptionOrNull()?.message ?: "Authentication failed")
+            }
+        }
     }
 
     fun disconnectGoogleAccount() {

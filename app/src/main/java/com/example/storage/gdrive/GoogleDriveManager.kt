@@ -12,10 +12,7 @@ import okhttp3.MediaType.Companion.toMediaType
 import okhttp3.OkHttpClient
 import okhttp3.Request
 import okhttp3.RequestBody.Companion.toRequestBody
-import org.json.JSONArray
 import org.json.JSONObject
-import java.text.SimpleDateFormat
-import java.util.Date
 import java.util.Locale
 import java.util.concurrent.TimeUnit
 
@@ -48,10 +45,17 @@ data class DriveQuotaInfo(
     }
 }
 
+sealed class DriveAuthState {
+    object Disconnected : DriveAuthState()
+    object Authenticating : DriveAuthState()
+    data class Connected(val email: String, val displayName: String, val quota: DriveQuotaInfo) : DriveAuthState()
+    data class Error(val message: String) : DriveAuthState()
+}
+
 /**
  * Manages Google Account authentication and Google Drive Cloud storage for GR AI.
- * Allows offloading large AI model files, datasets, team rules, and RAG archives
- * to Google Drive instead of consuming physical device storage.
+ * Requires a verified Google OAuth access token to communicate with Google Drive API v3.
+ * Never reports simulated metadata as a successful cloud backup.
  */
 class GoogleDriveManager(
     private val context: Context,
@@ -72,12 +76,15 @@ class GoogleDriveManager(
     }
 
     private val httpClient = OkHttpClient.Builder()
-        .connectTimeout(30, TimeUnit.SECONDS)
-        .readTimeout(60, TimeUnit.SECONDS)
-        .writeTimeout(60, TimeUnit.SECONDS)
+        .connectTimeout(20, TimeUnit.SECONDS)
+        .readTimeout(45, TimeUnit.SECONDS)
+        .writeTimeout(45, TimeUnit.SECONDS)
         .build()
 
-    private val _isConnected = MutableStateFlow(secureStorage.googleDriveConnected)
+    private val _authState = MutableStateFlow<DriveAuthState>(DriveAuthState.Disconnected)
+    val authState: StateFlow<DriveAuthState> = _authState.asStateFlow()
+
+    private val _isConnected = MutableStateFlow(false)
     val isConnected: StateFlow<Boolean> = _isConnected.asStateFlow()
 
     private val _accountEmail = MutableStateFlow(secureStorage.googleAccountEmail)
@@ -101,39 +108,91 @@ class GoogleDriveManager(
     private val _preferCloudStorage = MutableStateFlow(secureStorage.preferCloudStorage)
     val preferCloudStorage: StateFlow<Boolean> = _preferCloudStorage.asStateFlow()
 
-    init {
-        if (_isConnected.value) {
-            refreshDriveQuota()
-            loadSampleDriveItems()
-        }
-    }
-
     fun setPreferCloudStorage(prefer: Boolean) {
         secureStorage.preferCloudStorage = prefer
         _preferCloudStorage.value = prefer
     }
 
     /**
-     * Connect real Google Account with user email (defaulting to developer/owner or user's provided account).
+     * Authenticates with Google Drive using a real OAuth access token.
+     * Verifies token against the Google Drive API 'about' endpoint before reporting success.
      */
-    fun connectGoogleAccount(email: String, displayName: String = "GM Ripon", token: String = "") {
-        val finalEmail = if (email.isBlank()) "gmripon703@gmail.com" else email.trim()
-        val finalName = if (displayName.isBlank()) "GM Ripon" else displayName.trim()
-
-        secureStorage.googleDriveConnected = true
-        secureStorage.googleAccountEmail = finalEmail
-        secureStorage.googleAccountDisplayName = finalName
-        if (token.isNotBlank()) {
-            secureStorage.googleDriveAccessToken = token.trim()
+    suspend fun authenticateWithToken(token: String): Result<DriveQuotaInfo> = withContext(Dispatchers.IO) {
+        val cleanToken = token.trim()
+        if (cleanToken.isBlank()) {
+            val err = "OAuth access token is required to authenticate with Google Drive"
+            _authState.value = DriveAuthState.Error(err)
+            _syncStatus.value = err
+            return@withContext Result.failure(IllegalArgumentException(err))
         }
 
-        _isConnected.value = true
-        _accountEmail.value = finalEmail
-        _accountDisplayName.value = finalName
-        _syncStatus.value = "Connected to Google Account ($finalEmail) with Google Drive file access."
+        _authState.value = DriveAuthState.Authenticating
+        _isSyncing.value = true
+        _syncStatus.value = "Verifying token with Google Drive API..."
 
-        refreshDriveQuota()
-        loadSampleDriveItems()
+        try {
+            val request = Request.Builder()
+                .url("https://www.googleapis.com/drive/v3/about?fields=user,storageQuota")
+                .addHeader("Authorization", "Bearer $cleanToken")
+                .get()
+                .build()
+
+            val response = httpClient.newCall(request).execute()
+            val bodyString = response.body?.string() ?: ""
+
+            if (!response.isSuccessful) {
+                val errorMsg = "Google Drive API authentication rejected (HTTP ${response.code}): $bodyString"
+                Log.w(TAG, errorMsg)
+                disconnectGoogleAccount()
+                _authState.value = DriveAuthState.Error("Authentication failed (HTTP ${response.code})")
+                _syncStatus.value = "Error: Invalid or expired OAuth token."
+                return@withContext Result.failure(IllegalStateException(errorMsg))
+            }
+
+            val json = JSONObject(bodyString)
+            val userObj = json.optJSONObject("user")
+            val quotaObj = json.optJSONObject("storageQuota")
+
+            val email = userObj?.optString("emailAddress").orEmpty().ifBlank { "Google User" }
+            val name = userObj?.optString("displayName").orEmpty().ifBlank { email }
+
+            val limit = quotaObj?.optLong("limit", 0L) ?: 0L
+            val usage = quotaObj?.optLong("usage", 0L) ?: 0L
+            val usageInDrive = quotaObj?.optLong("usageInDrive", 0L) ?: 0L
+
+            val quota = DriveQuotaInfo(
+                limitBytes = limit,
+                usageBytes = usage,
+                usageInDriveBytes = usageInDrive,
+                userEmail = email,
+                displayName = name
+            )
+
+            // Persist valid state
+            secureStorage.googleDriveConnected = true
+            secureStorage.googleDriveAccessToken = cleanToken
+            secureStorage.googleAccountEmail = email
+            secureStorage.googleAccountDisplayName = name
+
+            _accountEmail.value = email
+            _accountDisplayName.value = name
+            _driveQuota.value = quota
+            _isConnected.value = true
+            _authState.value = DriveAuthState.Connected(email, name, quota)
+            _syncStatus.value = "Connected to Google Account ($email) with Drive API access."
+
+            // Refresh real files
+            fetchDriveFilesInternal(cleanToken)
+
+            Result.success(quota)
+        } catch (e: Exception) {
+            Log.e(TAG, "Exception during Drive authentication", e)
+            _authState.value = DriveAuthState.Error(e.localizedMessage ?: "Network error during authentication")
+            _syncStatus.value = "Connection error: ${e.localizedMessage}"
+            Result.failure(e)
+        } finally {
+            _isSyncing.value = false
+        }
     }
 
     fun disconnectGoogleAccount() {
@@ -147,92 +206,92 @@ class GoogleDriveManager(
         _accountDisplayName.value = ""
         _driveQuota.value = null
         _driveFiles.value = emptyList()
+        _authState.value = DriveAuthState.Disconnected
         _syncStatus.value = "Google Account disconnected."
     }
 
-    fun refreshDriveQuota() {
-        // 15 GB free default Google Drive quota
-        val totalBytes = 15L * 1024 * 1024 * 1024
-        val usedBytes = 2L * 1024 * 1024 * 1024 + (340L * 1024 * 1024) // 2.34 GB
-        val email = _accountEmail.value.ifBlank { "gmripon703@gmail.com" }
-        val name = _accountDisplayName.value.ifBlank { "GM Ripon" }
-
-        _driveQuota.value = DriveQuotaInfo(
-            limitBytes = totalBytes,
-            usageBytes = usedBytes,
-            usageInDriveBytes = 1L * 1024 * 1024 * 1024,
-            userEmail = email,
-            displayName = name
-        )
+    /**
+     * Fetches real files list from Google Drive API
+     */
+    suspend fun refreshDriveFiles(): Result<List<DriveFileItem>> = withContext(Dispatchers.IO) {
+        val token = secureStorage.googleDriveAccessToken
+        if (!_isConnected.value || token.isBlank()) {
+            return@withContext Result.failure(IllegalStateException("Google Drive is not authenticated."))
+        }
+        fetchDriveFilesInternal(token)
     }
 
-    private fun loadSampleDriveItems() {
-        val now = SimpleDateFormat("yyyy-MM-dd HH:mm", Locale.getDefault()).format(Date())
-        val initialItems = listOf(
-            DriveFileItem(
-                id = "gdrive-team-rules-01",
-                name = FILE_TEAM_RULES,
-                sizeBytes = 28 * 1024,
-                mimeType = "application/json",
-                modifiedTime = now,
-                isAppResource = true
-            ),
-            DriveFileItem(
-                id = "gdrive-rag-archive-01",
-                name = FILE_RAG_ARCHIVE,
-                sizeBytes = 145 * 1024,
-                mimeType = "application/json",
-                modifiedTime = now,
-                isAppResource = true
-            ),
-            DriveFileItem(
-                id = "gdrive-coder-model-link",
-                name = "qwen2.5-coder-1.5b-cloud-manifest.json",
-                sizeBytes = 12 * 1024,
-                mimeType = "application/json",
-                modifiedTime = now,
-                isAppResource = true
-            )
-        )
-        _driveFiles.value = initialItems
+    private fun fetchDriveFilesInternal(token: String): Result<List<DriveFileItem>> {
+        return try {
+            val url = "https://www.googleapis.com/drive/v3/files?spaces=drive,appDataFolder&fields=files(id,name,size,mimeType,modifiedTime,trashed)&q=trashed=false&pageSize=50"
+            val request = Request.Builder()
+                .url(url)
+                .addHeader("Authorization", "Bearer $token")
+                .get()
+                .build()
+
+            val response = httpClient.newCall(request).execute()
+            val body = response.body?.string() ?: ""
+
+            if (!response.isSuccessful) {
+                return Result.failure(Exception("Failed to list files (${response.code}): $body"))
+            }
+
+            val json = JSONObject(body)
+            val filesArr = json.optJSONArray("files") ?: org.json.JSONArray()
+            val items = mutableListOf<DriveFileItem>()
+
+            for (i in 0 until filesArr.length()) {
+                val f = filesArr.getJSONObject(i)
+                val id = f.optString("id", "")
+                val name = f.optString("name", "unnamed")
+                val size = f.optLong("size", 0L)
+                val mime = f.optString("mimeType", "application/octet-stream")
+                val mod = f.optString("modifiedTime", "").take(16).replace("T", " ")
+
+                items.add(
+                    DriveFileItem(
+                        id = id,
+                        name = name,
+                        sizeBytes = size,
+                        mimeType = mime,
+                        modifiedTime = mod,
+                        isAppResource = name.startsWith("gr_ai_") || name.endsWith(".json") || name.endsWith(".gguf")
+                    )
+                )
+            }
+
+            _driveFiles.value = items
+            Result.success(items)
+        } catch (e: Exception) {
+            Log.e(TAG, "Error fetching drive files", e)
+            Result.failure(e)
+        }
     }
 
     /**
      * Backup Team Rules to Google Drive
      */
     suspend fun syncTeamRulesToDrive(rulesJson: String): Result<String> = withContext(Dispatchers.IO) {
-        if (!_isConnected.value) {
-            return@withContext Result.failure(Exception("Google Account not connected"))
+        val token = secureStorage.googleDriveAccessToken
+        if (!_isConnected.value || token.isBlank()) {
+            val err = "Google Drive is not authenticated. Please provide a valid Google OAuth access token."
+            _syncStatus.value = err
+            return@withContext Result.failure(IllegalStateException(err))
         }
 
         _isSyncing.value = true
-        _syncStatus.value = "Syncing Team Rules to Google Drive..."
+        _syncStatus.value = "Uploading Team Rules to Google Drive..."
 
         try {
-            val token = secureStorage.googleDriveAccessToken
-            val result = if (token.isNotBlank()) {
-                uploadToDriveApi(FILE_TEAM_RULES, "application/json", rulesJson.toByteArray(Charsets.UTF_8), token)
-            } else {
-                // Simulated save to cloud drive metadata
-                val now = SimpleDateFormat("yyyy-MM-dd HH:mm", Locale.getDefault()).format(Date())
-                val updated = _driveFiles.value.filter { it.name != FILE_TEAM_RULES } + DriveFileItem(
-                    id = "gdrive-team-rules-${System.currentTimeMillis()}",
-                    name = FILE_TEAM_RULES,
-                    sizeBytes = rulesJson.length.toLong(),
-                    mimeType = "application/json",
-                    modifiedTime = now,
-                    isAppResource = true
-                )
-                _driveFiles.value = updated
-                "gr_ai_team_rules.json synced to Google Drive (${rulesJson.length} bytes)"
-            }
-
+            val fileId = uploadToDriveApi(FILE_TEAM_RULES, "application/json", rulesJson.toByteArray(Charsets.UTF_8), token)
             secureStorage.googleDriveLastSync = System.currentTimeMillis()
-            _syncStatus.value = "Success: Team Rules saved in Google Drive space."
-            Result.success(result)
+            _syncStatus.value = "Success: Team Rules uploaded to Google Drive (ID: $fileId)."
+            fetchDriveFilesInternal(token)
+            Result.success(fileId)
         } catch (e: Exception) {
-            Log.e(TAG, "Failed to sync team rules to Drive", e)
-            _syncStatus.value = "Sync failed: ${e.localizedMessage}"
+            Log.e(TAG, "Failed to upload team rules to Drive", e)
+            _syncStatus.value = "Upload failed: ${e.localizedMessage}"
             Result.failure(e)
         } finally {
             _isSyncing.value = false
@@ -243,37 +302,25 @@ class GoogleDriveManager(
      * Backup RAG Documents to Google Drive
      */
     suspend fun syncRagArchiveToDrive(ragArchiveJson: String): Result<String> = withContext(Dispatchers.IO) {
-        if (!_isConnected.value) {
-            return@withContext Result.failure(Exception("Google Account not connected"))
+        val token = secureStorage.googleDriveAccessToken
+        if (!_isConnected.value || token.isBlank()) {
+            val err = "Google Drive is not authenticated. Please provide a valid Google OAuth access token."
+            _syncStatus.value = err
+            return@withContext Result.failure(IllegalStateException(err))
         }
 
         _isSyncing.value = true
-        _syncStatus.value = "Syncing RAG Documents to Google Drive..."
+        _syncStatus.value = "Uploading RAG Documents to Google Drive..."
 
         try {
-            val token = secureStorage.googleDriveAccessToken
-            val result = if (token.isNotBlank()) {
-                uploadToDriveApi(FILE_RAG_ARCHIVE, "application/json", ragArchiveJson.toByteArray(Charsets.UTF_8), token)
-            } else {
-                val now = SimpleDateFormat("yyyy-MM-dd HH:mm", Locale.getDefault()).format(Date())
-                val updated = _driveFiles.value.filter { it.name != FILE_RAG_ARCHIVE } + DriveFileItem(
-                    id = "gdrive-rag-archive-${System.currentTimeMillis()}",
-                    name = FILE_RAG_ARCHIVE,
-                    sizeBytes = ragArchiveJson.length.toLong(),
-                    mimeType = "application/json",
-                    modifiedTime = now,
-                    isAppResource = true
-                )
-                _driveFiles.value = updated
-                "gr_ai_rag_archive.json synced to Google Drive (${ragArchiveJson.length} bytes)"
-            }
-
+            val fileId = uploadToDriveApi(FILE_RAG_ARCHIVE, "application/json", ragArchiveJson.toByteArray(Charsets.UTF_8), token)
             secureStorage.googleDriveLastSync = System.currentTimeMillis()
-            _syncStatus.value = "Success: RAG Documents backed up to Google Drive."
-            Result.success(result)
+            _syncStatus.value = "Success: RAG Documents uploaded to Google Drive (ID: $fileId)."
+            fetchDriveFilesInternal(token)
+            Result.success(fileId)
         } catch (e: Exception) {
-            Log.e(TAG, "Failed to sync RAG to Drive", e)
-            _syncStatus.value = "Sync failed: ${e.localizedMessage}"
+            Log.e(TAG, "Failed to upload RAG to Drive", e)
+            _syncStatus.value = "Upload failed: ${e.localizedMessage}"
             Result.failure(e)
         } finally {
             _isSyncing.value = false
@@ -284,37 +331,25 @@ class GoogleDriveManager(
      * Backup Chat History to Google Drive
      */
     suspend fun syncChatHistoryToDrive(chatHistoryJson: String): Result<String> = withContext(Dispatchers.IO) {
-        if (!_isConnected.value) {
-            return@withContext Result.failure(Exception("Google Account not connected"))
+        val token = secureStorage.googleDriveAccessToken
+        if (!_isConnected.value || token.isBlank()) {
+            val err = "Google Drive is not authenticated. Please provide a valid Google OAuth access token."
+            _syncStatus.value = err
+            return@withContext Result.failure(IllegalStateException(err))
         }
 
         _isSyncing.value = true
-        _syncStatus.value = "Syncing Chat Logs to Google Drive..."
+        _syncStatus.value = "Uploading Chat Logs to Google Drive..."
 
         try {
-            val token = secureStorage.googleDriveAccessToken
-            val result = if (token.isNotBlank()) {
-                uploadToDriveApi(FILE_CHAT_HISTORY, "application/json", chatHistoryJson.toByteArray(Charsets.UTF_8), token)
-            } else {
-                val now = SimpleDateFormat("yyyy-MM-dd HH:mm", Locale.getDefault()).format(Date())
-                val updated = _driveFiles.value.filter { it.name != FILE_CHAT_HISTORY } + DriveFileItem(
-                    id = "gdrive-chat-history-${System.currentTimeMillis()}",
-                    name = FILE_CHAT_HISTORY,
-                    sizeBytes = chatHistoryJson.length.toLong(),
-                    mimeType = "application/json",
-                    modifiedTime = now,
-                    isAppResource = true
-                )
-                _driveFiles.value = updated
-                "gr_ai_chat_history.json synced to Google Drive (${chatHistoryJson.length} bytes)"
-            }
-
+            val fileId = uploadToDriveApi(FILE_CHAT_HISTORY, "application/json", chatHistoryJson.toByteArray(Charsets.UTF_8), token)
             secureStorage.googleDriveLastSync = System.currentTimeMillis()
-            _syncStatus.value = "Success: Chat history saved to Google Drive."
-            Result.success(result)
+            _syncStatus.value = "Success: Chat history uploaded to Google Drive (ID: $fileId)."
+            fetchDriveFilesInternal(token)
+            Result.success(fileId)
         } catch (e: Exception) {
-            Log.e(TAG, "Failed to sync chat history to Drive", e)
-            _syncStatus.value = "Sync failed: ${e.localizedMessage}"
+            Log.e(TAG, "Failed to upload chat history to Drive", e)
+            _syncStatus.value = "Upload failed: ${e.localizedMessage}"
             Result.failure(e)
         } finally {
             _isSyncing.value = false
@@ -322,7 +357,7 @@ class GoogleDriveManager(
     }
 
     /**
-     * Direct upload via Google Drive v3 REST API
+     * Direct upload via Google Drive v3 REST API multipart endpoint
      */
     private fun uploadToDriveApi(fileName: String, mimeType: String, data: ByteArray, token: String): String {
         val boundary = "==GR_AI_MULTIPART_BOUNDARY_${System.currentTimeMillis()}=="
@@ -367,7 +402,7 @@ class GoogleDriveManager(
     }
 
     /**
-     * Download or stream asset from Google Drive without storing full copy in physical flash
+     * Download or stream asset from Google Drive
      */
     suspend fun streamFromDrive(fileId: String): Result<ByteArray> = withContext(Dispatchers.IO) {
         val token = secureStorage.googleDriveAccessToken
